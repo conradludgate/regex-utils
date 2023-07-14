@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 regex-automata = "0.3.3"
 petgraph = "0.6.3"
+indexmap = "2"

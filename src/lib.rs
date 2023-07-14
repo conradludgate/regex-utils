@@ -1,9 +1,7 @@
-use std::collections::{hash_map, HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
-use petgraph::{
-    graph::{Graph, NodeIndex},
-    Directed,
-};
+use indexmap::IndexSet;
+use petgraph::prelude::DiGraphMap;
 use regex_automata::{
     dfa::{dense::DFA, Automaton},
     util::{
@@ -16,16 +14,25 @@ use regex_automata::{
 pub fn add(left: usize, right: usize) -> usize {
     left + right
 }
-type G = Graph<StateID, u8, Directed>;
-pub struct RegexBfs<'a, A> {
+type G = DiGraphMap<StateID, IndexSet<u8>>;
+
+// a hybrid depth-breadth first search impl.
+// it's depth first search until it hits a cycle, at which point the branch splits.
+pub struct RegexSearch<'a, A> {
     dfa: &'a A,
     classes: &'a ByteClasses,
-    states: HashMap<StateID, NodeIndex>,
     graph: G,
-    pub stack: VecDeque<NodeIndex>,
+    cycle_starts: HashSet<StateID>,
+    stacks: VecDeque<Stack>,
 }
 
-impl<'a, T> From<&'a DFA<T>> for RegexBfs<'a, DFA<T>>
+struct Stack {
+    stack: Vec<(StateID, u8, usize)>,
+    stash: Vec<StateID>,
+    str: Vec<u8>,
+}
+
+impl<'a, T> From<&'a DFA<T>> for RegexSearch<'a, DFA<T>>
 where
     DFA<T>: Automaton,
     T: AsRef<[u32]>,
@@ -35,18 +42,21 @@ where
         let mut graph = G::new();
         let start = graph.add_node(state);
         let classes = dfa.byte_classes();
-        let states = HashMap::from([(state, start)]);
         Self {
             dfa,
             classes,
             graph,
-            stack: VecDeque::from([start]),
-            states,
+            cycle_starts: HashSet::new(),
+            stacks: VecDeque::from([Stack {
+                stack: vec![(start, 0, 0)],
+                stash: vec![],
+                str: vec![],
+            }]),
         }
     }
 }
 
-impl<A> Iterator for RegexBfs<'_, A>
+impl<A> Iterator for RegexSearch<'_, A>
 where
     A: Automaton,
 {
@@ -54,85 +64,59 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let current = self.stack.pop_front()?;
-            let state = self.graph[current];
+            let mut stack = self.stacks.pop_front()?;
+            let Some((current, b, depth)) = stack.stack.pop() else { continue };
+            stack.stash.truncate(depth);
+            stack.str.truncate(depth);
+            stack.stash.push(current);
+            stack.str.push(b);
 
-            for i in 0..self.classes.alphabet_len() {
-                for b in self.classes.elements(Unit::u8(i as u8)) {
-                    if let Some(b) = b.as_u8() {
-                        let next_state = self.dfa.next_state(state, b);
-                        if self.dfa.is_dead_state(next_state) {
-                            break;
+            if self.cycle_starts.contains(&current) {
+                for (_, next, edge) in self.graph.edges(current) {
+                    for b in edge {
+                        self.stacks.push_back(Stack {
+                            stack: vec![(next, *b, depth + 1)],
+                            stash: stack.stash.clone(),
+                            str: stack.str.clone(),
+                        });
+                    }
+                }
+            } else {
+                for i in 0..self.classes.alphabet_len() {
+                    for b in self.classes.elements(Unit::u8(i as u8)) {
+                        if let Some(b) = b.as_u8() {
+                            let next_state = self.dfa.next_state(current, b);
+                            if self.dfa.is_dead_state(next_state) {
+                                break;
+                            }
+
+                            let next = self.graph.add_node(next_state);
+                            let mut edge =
+                                self.graph.remove_edge(current, next).unwrap_or_default();
+                            let first = !edge.insert(b);
+                            self.graph.add_edge(current, next, edge);
+                            let repeat = stack.stash.contains(&next);
+
+                            if repeat && first {
+                                self.cycle_starts.insert(next_state);
+                            }
+                            stack.stack.push((next, b, depth + 1));
                         }
-
-                        // let next = match self.states.entry(next_state) {
-                        //     hash_map::Entry::Occupied(o) => *o.get(),
-                        //     hash_map::Entry::Vacant(v) => *v.insert(self.graph.add_node(next_state)),
-                        // };
-                        let next = self.graph.add_node(next_state);
-                        self.graph.add_edge(current, next, b);
-                        self.stack.push_back(next);
                     }
                 }
             }
 
             // test that this state is final
-            let eoi_state = self.dfa.next_eoi_state(state);
+            let eoi_state = self.dfa.next_eoi_state(current);
             if self.dfa.is_match_state(eoi_state) {
-                return Some(string(&self.graph, current));
+                let res = stack.str[1..].to_owned();
+                self.stacks.push_back(stack);
+                return Some(res);
             }
 
-            // let (state, depth, mut elements) = self.stack.pop_front()?;
-            // self.string.truncate(depth);
-
-            // // get the next element from this set
-            // if let Some(b) = elements.next() {
-            //     if let Some(b) = b.as_u8() {
-            //         // transition the state
-            //         let new_state = self.dfa.next_state(state, b);
-            //         // if the state is still valid
-            //         if !self.dfa.is_dead_state(new_state) {
-            //             // re-insert the previous stack position
-            //             self.stack.push_front((state, depth, elements));
-            //             // insert this byte into the search string
-            //             self.string.push(b);
-
-            //             // for all possible set of element classes,
-            //             // insert to the stack search space.
-            //             for i in (0..self.classes.alphabet_len()) {
-            //                 self.stack.push_back((
-            //                     new_state,
-            //                     depth + 1,
-            //                     self.classes.elements(Unit::u8(i as u8)),
-            //                 ));
-            //             }
-
-            //             // test that this state is final
-            //             let eoi_state = self.dfa.next_eoi_state(new_state);
-            //             if self.dfa.is_match_state(eoi_state) {
-            //                 return Some(self.string.clone());
-            //             }
-            //         }
-            //     } else {
-            //         let new_state = self.dfa.next_eoi_state(state);
-            //         if self.dfa.is_match_state(new_state) {
-            //             return Some(self.string.clone());
-            //         }
-            //     }
-            // }
+            self.stacks.push_back(stack);
         }
     }
-}
-
-fn string(graph: &G, mut current: NodeIndex) -> Vec<u8> {
-    let mut s = vec![];
-    while let Some(edge) = graph.first_edge(current, petgraph::Direction::Incoming) {
-        let b = graph[edge];
-        let (prev, _) = graph.edge_endpoints(edge).unwrap();
-        current = prev;
-        s.insert(0, b);
-    }
-    s
 }
 
 #[cfg(test)]
@@ -142,21 +126,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bfs_fixed() {
+    fn fixed() {
         let dfa = DFA::new(r"^[0-1]{4}-[0-1]{2}-[0-1]{2}$").unwrap();
-        let x = RegexBfs::from(&dfa);
-
-        for b in x.take(20) {
-            dbg!(String::from_utf8_lossy(&b));
+        let x: HashSet<Vec<u8>> = RegexSearch::from(&dfa).collect();
+        assert_eq!(x.len(), 256);
+        for y in x {
+            assert_eq!(y.len(), 10);
         }
     }
-    #[test]
-    fn bfs_repeated() {
-        let dfa = DFA::new(r"^a+(0|1)$").unwrap();
-        let x = RegexBfs::from(&dfa);
 
-        for b in x.take(20) {
-            dbg!(String::from_utf8_lossy(&b));
-        }
+    #[test]
+    fn repeated() {
+        let dfa = DFA::new(r"^a+(0|1)$").unwrap();
+        let x: HashSet<Vec<u8>> = RegexSearch::from(&dfa).take(20).collect();
+        let y = HashSet::from_iter([
+            b"a0".to_vec(),
+            b"a1".to_vec(),
+            b"aa0".to_vec(),
+            b"aa1".to_vec(),
+            b"aaa0".to_vec(),
+            b"aaa1".to_vec(),
+            b"aaaa0".to_vec(),
+            b"aaaa1".to_vec(),
+            b"aaaaa0".to_vec(),
+            b"aaaaa1".to_vec(),
+            b"aaaaaa0".to_vec(),
+            b"aaaaaa1".to_vec(),
+            b"aaaaaaa0".to_vec(),
+            b"aaaaaaa1".to_vec(),
+            b"aaaaaaaa0".to_vec(),
+            b"aaaaaaaa1".to_vec(),
+            b"aaaaaaaaa0".to_vec(),
+            b"aaaaaaaaa1".to_vec(),
+            b"aaaaaaaaaa0".to_vec(),
+            b"aaaaaaaaaa1".to_vec(),
+        ]);
+        assert_eq!(x, y);
     }
 }
