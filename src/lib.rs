@@ -72,15 +72,17 @@ where
             stack.str.push(b);
 
             if self.cycle_starts.contains(&current) {
+                let mut stack2 = vec![];
                 for (_, next, edge) in self.graph.edges(current) {
                     for b in edge {
-                        self.stacks.push_back(Stack {
-                            stack: vec![(next, *b, depth + 1)],
-                            stash: stack.stash.clone(),
-                            str: stack.str.clone(),
-                        });
+                        stack2.push((next, *b, depth + 1))
                     }
                 }
+                self.stacks.push_back(Stack {
+                    stack: stack2,
+                    stash: stack.stash.clone(),
+                    str: stack.str.clone(),
+                });
             } else {
                 for i in 0..self.classes.alphabet_len() {
                     for b in self.classes.elements(Unit::u8(i as u8)) {
@@ -158,8 +160,8 @@ mod tests {
             b"aaaaaaaa1".to_vec(),
             b"aaaaaaaaa0".to_vec(),
             b"aaaaaaaaa1".to_vec(),
-            b"aaaaaaaaaa0".to_vec(),
             b"aaaaaaaaaa1".to_vec(),
+            b"aaaaaaaaaaa1".to_vec(),
         ]);
         assert_eq!(x, y);
     }
