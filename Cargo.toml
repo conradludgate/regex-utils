@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 regex-automata = "0.3.0"
+tinyvec = { version = "1.0.0", features = ["alloc"] }
