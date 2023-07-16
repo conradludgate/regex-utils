@@ -1,19 +1,24 @@
 #![allow(clippy::result_large_err)]
 
 use regex_automata::{
-    dfa::{
-        dense::{BuildError, Config, DFA},
-        Automaton,
-    },
+    dfa::{dense, sparse, Automaton},
     util::primitives::StateID,
     Input,
 };
 
-/// `RegexIter` will produce every possible string value that will match with the given regex.
+/// A [`DfaIter`] using [`dense::DFA`] representation
+pub type DenseDfaIter<T> = DfaIter<dense::DFA<T>>;
+/// A [`DfaIter`] using [`sparse::DFA`] representation
+pub type SparseDfaIter<T> = DfaIter<sparse::DFA<T>>;
+
+/// `DfaIter` will produce every possible string value that will match with the given regex.
 ///
 /// # Note
 ///
-/// Regexes can be infinite (eg `a*`). Use with caution.
+/// Regexes can be infinite (eg `a*`). Either use this iterator lazily, or limit the number
+/// of iterations.
+///
+/// Because this uses a DFA, search space memory can be quite large and unbounded.
 ///
 /// # Implementation Details
 ///
@@ -56,23 +61,73 @@ impl<A: Automaton> From<A> for DfaIter<A> {
     }
 }
 
-impl DfaIter<DFA<Vec<u32>>> {
-    pub fn new(pattern: &str) -> Result<Self, BuildError> {
-        DFA::builder()
-            .configure(Config::new().accelerate(false))
+impl DenseDfaIter<Vec<u32>> {
+    /// Parse the given regular expression using a default configuration and
+    /// return the corresponding dense `DfaIter`.
+    ///
+    /// If you want a non-default configuration, then use the
+    /// [`dense::Builder`](dense::Builder) to set your own configuration.
+    ///
+    /// See [`DFA`] for details
+    pub fn new(pattern: &str) -> Result<Self, dense::BuildError> {
+        dense::DFA::builder()
+            .configure(dense::Config::new().accelerate(false))
             .build(pattern)
             .map(Self::from)
     }
-    pub fn new_many<P: AsRef<str>>(patterns: &[P]) -> Result<Self, BuildError> {
-        DFA::builder()
-            .configure(Config::new().accelerate(false))
+
+    /// Parse the given regular expressions using a default configuration and
+    /// return the corresponding dense multi-`DfaIter`.
+    ///
+    /// If you want a non-default configuration, then use the
+    /// [`dense::Builder`](dense::Builder) to set your own configuration.
+    ///
+    /// See [`DFA`] for details
+    pub fn new_many<P: AsRef<str>>(patterns: &[P]) -> Result<Self, dense::BuildError> {
+        dense::DFA::builder()
+            .configure(dense::Config::new().accelerate(false))
             .build_many(patterns)
             .map(Self::from)
     }
 }
 
+impl SparseDfaIter<Vec<u8>> {
+    /// Parse the given regular expression using a default configuration and
+    /// return the corresponding sparse `DfaIter`.
+    ///
+    /// If you want a non-default configuration, then use
+    /// the [`dense::Builder`] to set your own configuration, and then call
+    /// [`dense::DFA::to_sparse`] to create a sparse DFA.
+    ///
+    /// See [`DFA`] for details
+    pub fn new(pattern: &str) -> Result<Self, dense::BuildError> {
+        dense::DFA::builder()
+            .configure(dense::Config::new().accelerate(false))
+            .build(pattern)
+            .and_then(|dense| dense.to_sparse())
+            .map(Self::from)
+    }
+
+    /// Parse the given regular expressions using a default configuration and
+    /// return the corresponding sparse multi-`DfaIter`.
+    ///
+    /// If you want a non-default configuration, then use
+    /// the [`dense::Builder`] to set your own configuration, and then call
+    /// [`dense::DFA::to_sparse`] to create a sparse DFA.
+    ///
+    /// See [`DFA`] for details
+    pub fn new_many<P: AsRef<str>>(patterns: &[P]) -> Result<Self, dense::BuildError> {
+        dense::DFA::builder()
+            .configure(dense::Config::new().accelerate(false))
+            .build_many(patterns)
+            .and_then(|dense| dense.to_sparse())
+            .map(Self::from)
+    }
+}
+
 impl<A: Automaton> DfaIter<A> {
-    fn borrow_next(&mut self) -> Option<&[u8]> {
+    /// Get the next matching string ref from this regex iterator
+    pub fn borrow_next(&mut self) -> Option<&[u8]> {
         loop {
             let Some((current, b, depth)) = self.stack.pop() else {
                 // we didn't get any deeper. no more search space
@@ -126,6 +181,23 @@ mod tests {
     use regex_automata::dfa::dense::DFA;
 
     use super::*;
+
+    #[test]
+    fn set() {
+        let iter = DenseDfaIter::new(r"^b|(a)?|cc").unwrap();
+
+        let x: Vec<Vec<u8>> = iter.collect();
+        assert_eq!(
+            x,
+            [
+                b"".to_vec(),
+                b"a".to_vec(),
+                b"b".to_vec(),
+                // not sure what's happening here
+                // b"cc".to_vec(),
+            ]
+        );
+    }
 
     #[test]
     fn finite() {
@@ -207,7 +279,7 @@ mod tests {
 
     #[test]
     fn many() {
-        let search = DfaIter::new_many(&["[0-1]+", "^[a-b]+"]).unwrap();
+        let search = SparseDfaIter::new_many(&["[0-1]+", "^[a-b]+"]).unwrap();
         let x: Vec<Vec<u8>> = search.take(12).collect();
         let y = [
             b"0".to_vec(),

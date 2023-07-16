@@ -6,13 +6,18 @@ use regex_automata::{
 };
 use tinyvec::TinyVec;
 
-type SearchRange = TinyVec<[usize; 3]>;
+/// For Look/Union/BinaryUnion/Capture/Fail/Match: meaningless (should be empty)
+/// For ByteRange: indicates the current byte
+/// For Sparse: indicates the current byte for each ByteRange
+/// For Dense: indicates the current byte (0..=255)
+type SearchRange = TinyVec<[u16; 12]>;
 
 /// `NfaIter` will produce every possible string value that will match with the given nfa regex.
 ///
 /// # Note
 ///
-/// Regexes can be infinite (eg `a*`). Use with caution.
+/// Regexes can be infinite (eg `a*`). Either use this iterator lazily, or limit the number
+/// of iterations.
 pub struct NfaIter {
     // the graph to search
     pub(crate) regex: NFA,
@@ -23,8 +28,8 @@ pub struct NfaIter {
     depth: usize,
     // the max depth observed in the graph
     max_depth: usize,
-    // (state, edge, byte depth, search depth)
-    // the edge is used differently depending on what state we are exploring
+    // (state, search_range, byte depth, search depth)
+    // the search_range is used differently depending on what state we are exploring
     stack: Vec<(StateID, SearchRange, usize, usize)>,
     // the current path
     str: Vec<u8>,
@@ -51,11 +56,11 @@ impl From<NFA> for NfaIter {
 
 fn range_for(s: &State) -> SearchRange {
     match s {
-        State::ByteRange { trans } => tinyvec::tiny_vec![trans.start as usize],
+        State::ByteRange { trans } => tinyvec::tiny_vec![trans.start as u16],
         State::Sparse(s) => s
             .transitions
             .iter()
-            .map(|trans| trans.start as usize)
+            .map(|trans| trans.start as u16)
             .collect(),
         State::Dense(_) => tinyvec::tiny_vec![0],
         State::Look { .. } => tinyvec::tiny_vec![],
@@ -68,9 +73,24 @@ fn range_for(s: &State) -> SearchRange {
 }
 
 impl NfaIter {
+    /// Parse the given regular expression using a default configuration and
+    /// return the corresponding `NfaIter`.
+    ///
+    /// If you want a non-default configuration, then use the
+    /// [`thompson::Compiler`](regex_automata::nfa::thompson::Compiler) to set your own configuration.
+    ///
+    /// See [`NFA`] for details
     pub fn new(pattern: &str) -> Result<Self, BuildError> {
         NFA::compiler().build(pattern).map(Self::from)
     }
+
+    /// Parse the given regular expressions using a default configuration and
+    /// return the corresponding multi-`NfaIter`.
+    ///
+    /// If you want a non-default configuration, then use the
+    /// [`thompson::Compiler`](regex_automata::nfa::thompson::Compiler) to set your own configuration.
+    ///
+    /// See [`NFA`] for details
     pub fn new_many<P: AsRef<str>>(patterns: &[P]) -> Result<Self, BuildError> {
         NFA::compiler().build_many(patterns).map(Self::from)
     }
@@ -78,10 +98,9 @@ impl NfaIter {
     fn range_for(&self, s: StateID) -> SearchRange {
         range_for(self.regex.state(s))
     }
-}
 
-impl NfaIter {
-    fn borrow_next(&mut self) -> Option<&[u8]> {
+    /// Get the next matching string ref from this regex iterator
+    pub fn borrow_next(&mut self) -> Option<&[u8]> {
         loop {
             let Some((current, range, byte_depth, depth)) = self.stack.pop() else {
                 // we didn't get any deeper. no more search space
@@ -125,7 +144,7 @@ impl NfaIter {
                     State::Sparse(s) => {
                         for (i, &r) in range.iter().enumerate() {
                             let t = s.transitions[i];
-                            if r <= t.end as usize {
+                            if r <= t.end as u16 {
                                 // make sure we revisit this state
                                 let mut new_range = range.clone();
                                 new_range[i] += 1;
@@ -155,8 +174,8 @@ impl NfaIter {
                         }
                         self.str.push(range[0] as u8);
                         self.stack.push((
-                            d.transitions[range[0]],
-                            self.range_for(d.transitions[range[0]]),
+                            d.transitions[range[0] as usize],
+                            self.range_for(d.transitions[range[0] as usize]),
                             byte_depth + 1,
                             depth + 1,
                         ));
@@ -235,6 +254,17 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn set() {
+        let iter = NfaIter::new(r"b|(a)?|cc").unwrap();
+
+        let x: Vec<Vec<u8>> = iter.collect();
+        assert_eq!(
+            x,
+            [b"b".to_vec(), b"".to_vec(), b"cc".to_vec(), b"a".to_vec(),]
+        );
+    }
 
     #[test]
     fn finite() {
