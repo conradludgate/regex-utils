@@ -1,136 +1,139 @@
-use std::collections::{HashSet, VecDeque};
+#![allow(clippy::result_large_err)]
 
-use indexmap::IndexSet;
-use petgraph::prelude::DiGraphMap;
 use regex_automata::{
-    dfa::{dense::DFA, Automaton},
-    util::{
-        alphabet::{ByteClasses, Unit},
-        primitives::StateID,
+    dfa::{
+        dense::{BuildError, Config, DFA},
+        Automaton,
     },
+    util::primitives::StateID,
     Input,
 };
 
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
-type G = DiGraphMap<StateID, IndexSet<u8>>;
-
-// a hybrid depth-breadth first search impl.
-// it's depth first search until it hits a cycle, at which point the branch splits.
-pub struct RegexSearch<'a, A> {
-    dfa: &'a A,
-    classes: &'a ByteClasses,
-    graph: G,
-    cycle_starts: HashSet<StateID>,
-    stacks: VecDeque<Stack>,
-}
-
-struct Stack {
+/// `RegexIter` will produce every possible string value that will match with the given regex.
+///
+/// # Note
+///
+/// Regexes can be infinite (eg `a*`). Use with caution.
+///
+/// # Implementation Details
+///
+/// Given a `DFA` (Deterministic Finite Automaton), the iterator walks the graph
+/// of states using [`IDDFS`](https://en.wikipedia.org/wiki/Iterative_deepening_depth-first_search)
+/// to traverse through every possible state path. At each depth, if we find a match, it is returned.
+///
+/// The order of matches is not guaranteed, but it currently returns all strings in lexicographical byte ordering.
+pub struct RegexIter<A> {
+    // the graph to search
+    dfa: A,
+    // the start node of the graph
+    start: StateID,
+    // the max depth we currently want to search
+    depth: usize,
+    // the max depth observed in the graph
+    max_depth: usize,
+    // (state, edge, depth)
     stack: Vec<(StateID, u8, usize)>,
-    stash: Vec<StateID>,
+    // the current path
     str: Vec<u8>,
 }
 
-impl<'a, T> From<&'a DFA<T>> for RegexSearch<'a, DFA<T>>
-where
-    DFA<T>: Automaton,
-    T: AsRef<[u32]>,
-{
-    fn from(dfa: &'a DFA<T>) -> Self {
-        let state = dfa.start_state_forward(&Input::new("")).unwrap();
-        let mut graph = G::new();
-        let start = graph.add_node(state);
-        let classes = dfa.byte_classes();
+impl<A: Automaton> From<A> for RegexIter<A> {
+    fn from(dfa: A) -> Self {
+        // anchored because if we didn't anchor our search we would have an infinite amount of prefixes that were valid
+        // and that isn't very interesting
+        let start = dfa
+            .start_state_forward(&Input::new("").anchored(regex_automata::Anchored::Yes))
+            .unwrap();
+
         Self {
             dfa,
-            classes,
-            graph,
-            cycle_starts: HashSet::new(),
-            stacks: VecDeque::from([Stack {
-                stack: vec![(start, 0, 0)],
-                stash: vec![],
-                str: vec![],
-            }]),
+            start,
+            depth: 0,
+            max_depth: 0,
+            stack: vec![(start, 0, 0)],
+            str: vec![],
         }
     }
 }
 
-impl<A> Iterator for RegexSearch<'_, A>
-where
-    A: Automaton,
-{
+impl RegexIter<DFA<Vec<u32>>> {
+    pub fn new(pattern: &str) -> Result<Self, BuildError> {
+        DFA::builder()
+            .configure(Config::new().accelerate(false))
+            .build(pattern)
+            .map(Self::from)
+    }
+    pub fn new_many<P: AsRef<str>>(patterns: &[P]) -> Result<Self, BuildError> {
+        DFA::builder()
+            .configure(Config::new().accelerate(false))
+            .build_many(patterns)
+            .map(Self::from)
+    }
+}
+
+impl<A: Automaton> RegexIter<A> {
+    fn borrow_next(&mut self) -> Option<&[u8]> {
+        loop {
+            let Some((current, b, depth)) = self.stack.pop() else {
+                // we didn't get any deeper. no more search space
+                if self.max_depth < self.depth {
+                    break None;
+                }
+
+                self.depth += 1;
+                self.stack.clear();
+                self.stack.push((self.start, 0, 0));
+                continue;
+            };
+
+            // update recorded max depth
+            self.max_depth = usize::max(self.max_depth, depth);
+            self.str.truncate(depth);
+            self.str.push(b);
+
+            // check we can explore deeper
+            if depth < self.depth {
+                for b in (0..=255).rev() {
+                    let next_state = self.dfa.next_state(current, b);
+                    // check if the next state is valid
+                    if !self.dfa.is_dead_state(next_state) {
+                        self.stack.push((next_state, b, depth + 1));
+                    }
+                }
+            } else {
+                // test that this state is final
+                let eoi_state = self.dfa.next_eoi_state(current);
+                if self.dfa.is_match_state(eoi_state) {
+                    break Some(&self.str[1..]);
+                }
+            }
+        }
+    }
+}
+
+impl<A: Automaton> Iterator for RegexIter<A> {
     type Item = Vec<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let mut stack = self.stacks.pop_front()?;
-            let Some((current, b, depth)) = stack.stack.pop() else { continue };
-            stack.stash.truncate(depth);
-            stack.str.truncate(depth);
-            stack.stash.push(current);
-            stack.str.push(b);
-
-            if self.cycle_starts.contains(&current) {
-                let mut stack2 = vec![];
-                for (_, next, edge) in self.graph.edges(current) {
-                    for b in edge {
-                        stack2.push((next, *b, depth + 1))
-                    }
-                }
-                self.stacks.push_back(Stack {
-                    stack: stack2,
-                    stash: stack.stash.clone(),
-                    str: stack.str.clone(),
-                });
-            } else {
-                for i in 0..self.classes.alphabet_len() {
-                    for b in self.classes.elements(Unit::u8(i as u8)) {
-                        if let Some(b) = b.as_u8() {
-                            let next_state = self.dfa.next_state(current, b);
-                            if self.dfa.is_dead_state(next_state) {
-                                break;
-                            }
-
-                            let next = self.graph.add_node(next_state);
-                            let mut edge =
-                                self.graph.remove_edge(current, next).unwrap_or_default();
-                            let first = !edge.insert(b);
-                            self.graph.add_edge(current, next, edge);
-                            let repeat = stack.stash.contains(&next);
-
-                            if repeat && first {
-                                self.cycle_starts.insert(next_state);
-                            }
-                            stack.stack.push((next, b, depth + 1));
-                        }
-                    }
-                }
-            }
-
-            // test that this state is final
-            let eoi_state = self.dfa.next_eoi_state(current);
-            if self.dfa.is_match_state(eoi_state) {
-                let res = stack.str[1..].to_owned();
-                self.stacks.push_back(stack);
-                return Some(res);
-            }
-
-            self.stacks.push_back(stack);
-        }
+        self.borrow_next().map(ToOwned::to_owned)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use regex_automata::dfa::dense::DFA;
 
     use super::*;
 
     #[test]
-    fn fixed() {
-        let dfa = DFA::new(r"^[0-1]{4}-[0-1]{2}-[0-1]{2}$").unwrap();
-        let x: HashSet<Vec<u8>> = RegexSearch::from(&dfa).collect();
+    fn finite() {
+        let dfa = DFA::new(r"[0-1]{4}-[0-1]{2}-[0-1]{2}").unwrap();
+
+        // finite regex has finite iteration depth
+        // and no repeats
+        let x: HashSet<Vec<u8>> = RegexIter::from(&dfa).collect();
         assert_eq!(x.len(), 256);
         for y in x {
             assert_eq!(y.len(), 10);
@@ -139,9 +142,11 @@ mod tests {
 
     #[test]
     fn repeated() {
-        let dfa = DFA::new(r"^a+(0|1)$").unwrap();
-        let x: HashSet<Vec<u8>> = RegexSearch::from(&dfa).take(20).collect();
-        let y = HashSet::from_iter([
+        let dfa = DFA::new(r"a+(0|1)").unwrap();
+
+        // infinite regex iterates over all cases
+        let x: Vec<Vec<u8>> = RegexIter::from(&dfa).take(20).collect();
+        let y = [
             b"a0".to_vec(),
             b"a1".to_vec(),
             b"aa0".to_vec(),
@@ -160,9 +165,64 @@ mod tests {
             b"aaaaaaaa1".to_vec(),
             b"aaaaaaaaa0".to_vec(),
             b"aaaaaaaaa1".to_vec(),
+            b"aaaaaaaaaa0".to_vec(),
             b"aaaaaaaaaa1".to_vec(),
-            b"aaaaaaaaaaa1".to_vec(),
-        ]);
+        ];
+        assert_eq!(x, y);
+    }
+
+    #[test]
+    fn complex() {
+        let dfa = DFA::new(r"(a+|b+)*").unwrap();
+
+        // infinite regex iterates over all cases
+        let x: Vec<Vec<u8>> = RegexIter::from(&dfa).take(8).collect();
+        let y = [
+            b"".to_vec(),
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"aa".to_vec(),
+            b"ab".to_vec(),
+            b"ba".to_vec(),
+            b"bb".to_vec(),
+            b"aaa".to_vec(),
+        ];
+        assert_eq!(x, y);
+    }
+
+    #[test]
+    fn email() {
+        let dfa = DFA::new(r"[a-zA-Z0-9.!#$%&’*+/=?^_`{|}~-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*")
+            .unwrap();
+        let mut search = RegexIter::from(&dfa);
+
+        // skip a ~few
+        for _ in 0..100_000 {
+            search.borrow_next();
+        }
+
+        let x = search.borrow_next().unwrap();
+        assert_eq!(String::from_utf8_lossy(x), "0@hI");
+    }
+
+    #[test]
+    fn many() {
+        let search = RegexIter::new_many(&["[0-1]+", "^[a-b]+"]).unwrap();
+        let x: Vec<Vec<u8>> = search.take(12).collect();
+        let y = [
+            b"0".to_vec(),
+            b"1".to_vec(),
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"00".to_vec(),
+            b"01".to_vec(),
+            b"10".to_vec(),
+            b"11".to_vec(),
+            b"aa".to_vec(),
+            b"ab".to_vec(),
+            b"ba".to_vec(),
+            b"bb".to_vec(),
+        ];
         assert_eq!(x, y);
     }
 }
