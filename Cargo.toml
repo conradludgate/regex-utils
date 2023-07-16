@@ -2,6 +2,9 @@
 name = "regex-utils"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/conradludgate/regex-utils"
+description = "Regex utilities, like enumerating all strings that match a regex"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
